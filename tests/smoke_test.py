@@ -416,6 +416,64 @@ def test_research() -> None:
                      expect_keys=("snapshot",))
         RESULTS.append(("snapshot file exists", bool(snap.get("exists")), ""))
         print("[%s] snapshot file exists" % ("PASS" if snap.get("exists") else "FAIL"))
+
+        # --- propose: the verdicts are the whole point ---
+        cs_path = os.path.join(TMP, "mini.changeset.json")
+        proposed = check("excel_propose_changes", rs.excel_propose_changes(
+            handle=h, changeset_path=cs_path, note_source="unit test",
+            changes=[
+                {"sheet": "Model", "cell": "D2", "new_value": 1500,
+                 "reason": "guidance cut", "source": "notes line 3"},
+                {"sheet": "Model", "cell": "D4", "new_value": 999,
+                 "reason": "should be refused", "source": "notes line 4"},
+                {"sheet": "Model", "cell": "B2", "new_value": 1001,
+                 "reason": "restating history", "source": "notes line 5"},
+                {"sheet": "Model", "cell": "D3", "new_value": 0.255,
+                 "reason": "unchanged", "source": "notes line 6"},
+            ]), expect_keys=("counts", "changes"))
+        by_cell = {c["cell"]: c for c in proposed.get("changes", [])}
+        assert_equal("propose accepts a blue assumption cell",
+                     by_cell.get("D2", {}).get("verdict"), "ok")
+        assert_equal("propose BLOCKS a formula cell",
+                     by_cell.get("D4", {}).get("verdict"), "blocked")
+        assert_equal("propose warns on a non-assumption colour",
+                     by_cell.get("B2", {}).get("verdict"), "warn")
+        assert_equal("propose warns when the value is unchanged",
+                     by_cell.get("D3", {}).get("verdict"), "warn")
+        RESULTS.append(("propose records the formula it refused to overwrite",
+                        "=D2*D3" in str(by_cell.get("D4", {}).get("current_formula")),
+                        ""))
+        print("[%s] propose records the formula it refused to overwrite"
+              % ("PASS" if "=D2*D3" in str(by_cell.get("D4", {}).get("current_formula"))
+                 else "FAIL"))
+        RESULTS.append(("changeset file written", os.path.exists(cs_path), ""))
+        print("[%s] changeset file written" % ("PASS" if os.path.exists(cs_path)
+                                               else "FAIL"))
+
+        # --- apply: refuses without confirm, then writes + annotates ---
+        dry = rs.excel_apply_changeset(changeset_path=cs_path, handle=h)
+        assert_equal("apply refuses without confirm", dry.get("ok"), False)
+        assert_equal("apply counts blocked rows", dry.get("blocked"), 1)
+
+        before = xl.excel_read_range(handle=h, sheet="Model",
+                                     range_a1="D2").get("values")
+        applied = check("excel_apply_changeset(confirm)", rs.excel_apply_changeset(
+            changeset_path=cs_path, handle=h, confirm=True, snapshot=True),
+            expect_keys=("written", "cells"))
+        after = xl.excel_read_range(handle=h, sheet="Model",
+                                    range_a1="D2").get("values")
+        assert_equal("apply wrote the assumption cell", after, [[1500]])
+        RESULTS.append(("apply changed the value", before != after, ""))
+        print("[%s] apply changed the value" % ("PASS" if before != after else "FAIL"))
+        formula_after = xl.excel_read_range(handle=h, sheet="Model", range_a1="D4",
+                                            mode="formulas").get("values")
+        assert_equal("apply left the blocked formula intact",
+                     formula_after, [["=D2*D3"]])
+        info = xl.excel_cell_info(cell="D2", handle=h, sheet="Model")
+        RESULTS.append(("apply left an audit comment",
+                        "guidance cut" in str(info.get("comment", "")), ""))
+        print("[%s] apply left an audit comment"
+              % ("PASS" if "guidance cut" in str(info.get("comment", "")) else "FAIL"))
     finally:
         check("excel_close(model)", xl.excel_close(handle=h, save=False))
 

@@ -25,6 +25,7 @@ Design notes drawn from a real sell-side model (Huali 300979.SZ, 25 sheets,
 from __future__ import annotations
 
 import datetime as _dt
+import json
 import os
 import re
 from typing import Any
@@ -601,6 +602,238 @@ def excel_model_map(
 
 
 @com_tool
+def excel_propose_changes(
+    changes: list,
+    handle: str | None = None,
+    changeset_path: str | None = None,
+    note_source: str | None = None,
+    allow_formula_cells: bool = False,
+) -> dict[str, Any]:
+    """Validate a set of proposed model edits and write them to a changeset file.
+
+    The agent decides WHAT to change and why; this decides whether each edit is
+    safe to make, and records it so a human can review it outside the chat.
+
+    Each change is a dict:
+        {"sheet": "Breakdown", "cell": "L14", "new_value": 19500,
+         "reason": "1H26 Sportswear revenue 9,934mn, -12.4% YoY",
+         "source": "2026H1 report p15", "confidence": "high"}
+
+    Every proposal is checked against the live workbook and comes back with a
+    verdict:
+      ok            - a writable assumption/override cell
+      blocked       - the target holds a FORMULA; writing would silently break
+                      the model's structure. Change its driver instead, or pass
+                      allow_formula_cells=True deliberately.
+      warn          - writable but not a recognised assumption colour, or the
+                      value is unchanged, or the cell is empty
+    Nothing is written to the workbook here - use excel_apply_changeset.
+    """
+    if not isinstance(changes, list) or not changes:
+        raise ComToolError("changes must be a non-empty list")
+    wb = _wb(handle)
+    reviewed: list[dict[str, Any]] = []
+    counts = {"ok": 0, "warn": 0, "blocked": 0}
+
+    for item in changes:
+        if not isinstance(item, dict):
+            raise ComToolError("each change must be an object, got %r" % type(item))
+        cell_ref = item.get("cell")
+        if not cell_ref:
+            raise ComToolError("each change needs a 'cell'")
+        entry: dict[str, Any] = {
+            "sheet": item.get("sheet"),
+            "cell": cell_ref,
+            "new_value": item.get("new_value"),
+            "reason": item.get("reason"),
+            "source": item.get("source"),
+            "confidence": item.get("confidence"),
+        }
+        try:
+            ws = _sheet(wb, item.get("sheet"))
+            rng = ws.Range(cell_ref)
+        except Exception as exc:  # noqa: BLE001
+            entry.update(verdict="blocked", issue="cannot resolve cell: %s" % exc)
+            counts["blocked"] += 1
+            reviewed.append(entry)
+            continue
+
+        has_formula = bool(rng.HasFormula)
+        current = jsonable(rng.Value)
+        hexc = _hex_from_bgr(rng.Font.Color)
+        klass = _classify(hexc)
+        entry.update(
+            sheet=str(ws.Name),
+            current_value=current,
+            colour=hexc,
+            cell_class=klass,
+            has_formula=has_formula,
+            current_formula=jsonable(rng.Formula) if has_formula else None,
+        )
+        try:
+            entry["dependents"] = int(rng.Dependents.Count)
+        except Exception:  # noqa: BLE001 - no dependents
+            entry["dependents"] = 0
+
+        issues = []
+        if has_formula and not allow_formula_cells:
+            entry["verdict"] = "blocked"
+            issues.append(
+                "target is a formula (%s); overwriting it replaces model "
+                "structure with a hardcoded number" % entry["current_formula"]
+            )
+        else:
+            entry["verdict"] = "ok"
+            if klass not in WRITABLE_CLASSES:
+                entry["verdict"] = "warn"
+                issues.append(
+                    "cell is classed '%s' (%s), not a recognised assumption "
+                    "colour" % (klass, hexc)
+                )
+            if current is None:
+                entry["verdict"] = "warn"
+                issues.append("cell is currently empty")
+            elif current == item.get("new_value"):
+                entry["verdict"] = "warn"
+                issues.append("new value equals the current value")
+            if not item.get("reason") or not item.get("source"):
+                entry["verdict"] = "warn"
+                issues.append(
+                    "no reason/source cited - a model edit should point at the "
+                    "line of notes it came from"
+                )
+        entry["issues"] = issues
+        counts[entry["verdict"]] += 1
+        reviewed.append(entry)
+
+    target = changeset_path
+    if not target:
+        base = str(getattr(wb, "FullName", "")) or str(wb.Name)
+        root = os.path.splitext(base)[0] if os.path.dirname(base) else os.path.abspath(
+            os.path.splitext(str(wb.Name))[0])
+        target = root + ".changeset.json"
+    payload = {
+        "workbook": str(getattr(wb, "FullName", wb.Name)),
+        "created": _dt.datetime.now().isoformat(timespec="seconds"),
+        "note_source": note_source,
+        "counts": counts,
+        "changes": reviewed,
+        "applied": False,
+    }
+    os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+    with open(target, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=1)
+
+    return {
+        "changeset": target,
+        "counts": counts,
+        "changes": reviewed,
+        "next_step": (
+            "Show these to the user. Blocked rows must be re-pointed at the "
+            "driver cell. Then call excel_apply_changeset with confirm=true."
+        ),
+    }
+
+
+@com_tool(timeout=600)
+def excel_apply_changeset(
+    changeset_path: str,
+    confirm: bool = False,
+    handle: str | None = None,
+    snapshot: bool = True,
+    annotate: bool = True,
+    include_warnings: bool = True,
+) -> dict[str, Any]:
+    """Apply a reviewed changeset to the workbook. Requires confirm=True.
+
+    Takes a snapshot first, writes only rows the review passed, and leaves the
+    reason and source in a cell comment so the edit stays auditable months later.
+    Rows marked `blocked` are never written.
+    """
+    full = os.path.abspath(os.path.expanduser(changeset_path))
+    if not os.path.exists(full):
+        raise ComToolError("Changeset not found: " + full)
+    with open(full, "r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+
+    rows = payload.get("changes", [])
+    writable = [
+        r for r in rows
+        if r.get("verdict") == "ok" or (include_warnings and r.get("verdict") == "warn")
+    ]
+    if not confirm:
+        return {
+            "ok": False,
+            "error": "confirm=False - nothing was written",
+            "changeset": full,
+            "would_write": len(writable),
+            "blocked": sum(1 for r in rows if r.get("verdict") == "blocked"),
+            "preview": [
+                {"cell": "%s!%s" % (r.get("sheet"), r.get("cell")),
+                 "from": r.get("current_value"), "to": r.get("new_value"),
+                 "verdict": r.get("verdict"), "reason": r.get("reason")}
+                for r in writable[:20]
+            ],
+            "hint": "Show the preview to the user; call again with confirm=true "
+                    "once they approve.",
+        }
+
+    wb = _wb(handle or payload.get("workbook"))
+    snap = None
+    if snapshot:
+        snap = excel_snapshot(handle=handle or payload.get("workbook"),
+                             label="pre-changeset")
+        if not snap.get("ok", True):
+            return snap
+
+    written, failed = [], []
+    for r in writable:
+        try:
+            ws = _sheet(wb, r.get("sheet"))
+            rng = ws.Range(r["cell"])
+            before = jsonable(rng.Value)
+            rng.Value = r.get("new_value")
+            if annotate:
+                text = "m365-mcp %s\n%s\nsource: %s\nwas: %s" % (
+                    _dt.datetime.now().strftime("%Y-%m-%d"),
+                    r.get("reason") or "(no reason given)",
+                    r.get("source") or "(no source given)",
+                    before,
+                )
+                try:
+                    if rng.Comment is not None:
+                        rng.Comment.Delete()
+                except Exception:  # noqa: BLE001 - no existing comment
+                    pass
+                try:
+                    rng.AddComment(text[:900])
+                except Exception:  # noqa: BLE001 - comments can be disabled
+                    pass
+            written.append({"cell": "%s!%s" % (ws.Name, r["cell"]),
+                            "from": before, "to": r.get("new_value")})
+        except Exception as exc:  # noqa: BLE001
+            failed.append({"cell": "%s!%s" % (r.get("sheet"), r.get("cell")),
+                           "error": str(exc)[:200]})
+
+    payload["applied"] = True
+    payload["applied_at"] = _dt.datetime.now().isoformat(timespec="seconds")
+    payload["snapshot"] = snap.get("snapshot") if snap else None
+    payload["written"] = written
+    payload["failed"] = failed
+    with open(full, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=1)
+
+    return {
+        "changeset": full,
+        "snapshot": snap.get("snapshot") if snap else None,
+        "written": len(written),
+        "failed": failed,
+        "cells": written,
+        "note": "Workbook is edited but NOT saved - review it, then excel_save.",
+    }
+
+
+@com_tool
 def excel_trace_precedents(
     cell: str,
     handle: str | None = None,
@@ -720,4 +953,6 @@ TOOLS = [
     excel_model_map,
     excel_trace_precedents,
     excel_snapshot,
+    excel_propose_changes,
+    excel_apply_changeset,
 ]
