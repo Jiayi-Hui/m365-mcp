@@ -474,6 +474,49 @@ def test_research() -> None:
                         "guidance cut" in str(info.get("comment", "")), ""))
         print("[%s] apply left an audit comment"
               % ("PASS" if "guidance cut" in str(info.get("comment", "")) else "FAIL"))
+
+        # --- data sources: clean model needs no add-in ---
+        clean = check("excel_data_sources(clean)", rs.excel_data_sources(handle=h),
+                      expect_keys=("verdict",))
+        assert_equal("clean workbook is safe to edit", clean.get("verdict"),
+                     "safe_to_edit")
+
+        # --- model_check must find a broken subtotal on its own ---
+        xl.excel_add_sheet(name="Seg", handle=h)
+        xl.excel_write_range(handle=h, sheet="Seg", start_cell="A1", values=[
+            ["Item", "1H23", "2H23", "1H24", "2H24", "1H25"],
+            ["Total", 100.0, 110.0, 120.0, 130.0, 140.0],
+            ["Alpha", 60.0, 66.0, 72.0, 78.0, 84.0],
+            ["Beta", 25.0, 27.5, 30.0, 32.5, 35.0],
+            # last column is 10x what it should be (2.1 -> 21.0): the total row
+            # and the other five columns all disagree with it
+            ["Gamma", 15.0, 16.5, 18.0, 19.5, 210.0],
+        ])
+        checked = check("excel_model_check", rs.excel_model_check(
+            handle=h, sheets="Seg"), expect_keys=("findings",))
+        subs = [f for f in checked.get("findings", []) if f["check"] == "subtotal"]
+        RESULTS.append(("model_check finds the broken subtotal column",
+                        any(f.get("period") == "1H2025" for f in subs),
+                        "found %s" % [f.get("period") for f in subs]))
+        print("[%s] model_check finds the broken subtotal column"
+              % ("PASS" if any(f.get("period") == "1H2025" for f in subs) else "FAIL"))
+
+        # --- add-in dependency is detected and blocks writes ---
+        xl.excel_write_range(handle=h, sheet="Seg", start_cell="H1",
+                             values=[['=WSD("600519.SH","close")']],
+                             as_formula=True)
+        dep = check("excel_data_sources(wind)", rs.excel_data_sources(handle=h))
+        assert_equal("wind dependency detected", dep.get("addins_required"), ["wind"])
+        assert_equal("verdict turns read-only", dep.get("verdict"),
+                     "read_only_recommended")
+        guarded = rs.excel_apply_changeset(changeset_path=cs_path, handle=h,
+                                           confirm=True)
+        assert_equal("apply refuses while an add-in is missing",
+                     guarded.get("ok"), False)
+        RESULTS.append(("refusal names the missing add-in",
+                        "wind" in str(guarded.get("error", "")), ""))
+        print("[%s] refusal names the missing add-in"
+              % ("PASS" if "wind" in str(guarded.get("error", "")) else "FAIL"))
     finally:
         check("excel_close(model)", xl.excel_close(handle=h, save=False))
 
