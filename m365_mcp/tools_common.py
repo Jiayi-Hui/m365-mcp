@@ -110,6 +110,115 @@ def m365_quit_app(app: str, save_changes: bool = False, confirm: bool = False) -
     return {"quit": key, "saved": bool(save_changes)}
 
 
+@com_tool(timeout=300)
+def m365_release(
+    apps: str = "excel,word,powerpoint",
+    terminate_orphans: bool = True,
+) -> dict[str, Any]:
+    """Release Office instances this server started, and verify they really died.
+
+    Quit() often returns success while the process lives on with no window -
+    and a lingering EXCEL.EXE blocks installers. Wind's Excel add-in, for one,
+    refuses to install while any Excel is running, which makes an invisible
+    automation instance genuinely obstructive.
+
+    Safety: an instance is only touched when it holds no open documents, and a
+    process is only terminated when it has no visible window. Anything the user
+    has on screen is left alone.
+    """
+    import win32com.client as _w32
+    import win32gui
+    import win32process
+
+    def visible_windows_by_pid() -> set[int]:
+        pids: set[int] = set()
+
+        def cb(hwnd: int, _arg: Any) -> bool:
+            if win32gui.IsWindowVisible(hwnd) and win32gui.GetWindowText(hwnd):
+                try:
+                    pids.add(win32process.GetWindowThreadProcessId(hwnd)[1])
+                except Exception:  # noqa: BLE001
+                    pass
+            return True
+
+        win32gui.EnumWindows(cb, None)
+        return pids
+
+    exe_for = {"excel": "EXCEL.EXE", "word": "WINWORD.EXE",
+               "powerpoint": "POWERPNT.EXE", "publisher": "MSPUB.EXE",
+               "access": "MSACCESS.EXE"}
+    wanted = [normalize_app(a) for a in apps.split(",") if a.strip()]
+    report: list[dict[str, Any]] = []
+
+    for key in wanted:
+        row: dict[str, Any] = {"app": key, "quit": False, "documents": None}
+        if comcore.app_running(key):
+            try:
+                application = get_app(key)
+                docs = []
+                if key == "excel":
+                    docs = [w.Name for w in application.Workbooks]
+                elif key == "word":
+                    docs = [d.Name for d in application.Documents]
+                elif key == "powerpoint":
+                    docs = [p.Name for p in application.Presentations]
+                row["documents"] = docs
+                if docs:
+                    row["skipped"] = "holds %d open document(s)" % len(docs)
+                    report.append(row)
+                    continue
+                if key == "excel":
+                    for wb in application.Workbooks:
+                        try:
+                            wb.Saved = True
+                        except Exception:  # noqa: BLE001
+                            pass
+                application.Quit()
+                comcore.forget_app(key)
+                row["quit"] = True
+            except Exception as exc:  # noqa: BLE001
+                row["quit_error"] = str(exc)[:160]
+        report.append(row)
+
+    killed: list[dict[str, Any]] = []
+    survivors: list[dict[str, Any]] = []
+    if terminate_orphans:
+        visible = visible_windows_by_pid()
+        try:
+            wmi = _w32.GetObject("winmgmts:")
+            names = {exe_for[k] for k in wanted if k in exe_for}
+            for proc in wmi.InstancesOf("Win32_Process"):
+                try:
+                    name = str(proc.Name).upper()
+                    pid = int(proc.ProcessId)
+                except Exception:  # noqa: BLE001
+                    continue
+                if name not in names:
+                    continue
+                if pid in visible:
+                    survivors.append({"process": name, "pid": pid,
+                                      "reason": "has a visible window - left alone"})
+                    continue
+                try:
+                    proc.Terminate()
+                    killed.append({"process": name, "pid": pid})
+                except Exception as exc:  # noqa: BLE001
+                    survivors.append({"process": name, "pid": pid,
+                                      "reason": str(exc)[:120]})
+        except Exception as exc:  # noqa: BLE001
+            survivors.append({"process": "(enumeration failed)",
+                              "reason": str(exc)[:160]})
+
+    return {
+        "apps": report,
+        "terminated_orphans": killed,
+        "left_running": survivors,
+        "note": "Instances holding documents, and processes with a visible "
+                "window, are never touched. Run this before installing an "
+                "Office add-in.",
+    }
+
+
 @com_tool
 def office_convert(
     input_path: str, output_path: str, keep_open: bool = False
@@ -461,6 +570,7 @@ TOOLS = [
     m365_status,
     m365_list_handles,
     m365_quit_app,
+    m365_release,
     office_convert,
     com_describe,
     com_get,
