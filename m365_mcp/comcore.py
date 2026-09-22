@@ -43,6 +43,7 @@ DEFAULT_TIMEOUT = 180.0
 class _ComThread:
     def __init__(self) -> None:
         self._q: queue.Queue = queue.Queue()
+        self._ident: int | None = None
         self._thread = threading.Thread(
             target=self._loop, name="m365-com-sta", daemon=True
         )
@@ -50,6 +51,7 @@ class _ComThread:
 
     def _loop(self) -> None:
         # STA: Office automation requires it; MTA causes marshalling errors.
+        self._ident = threading.get_ident()
         pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
         try:
             while True:
@@ -67,6 +69,10 @@ class _ComThread:
             pythoncom.CoUninitialize()
 
     def call(self, fn: Callable[[], Any], timeout: float = DEFAULT_TIMEOUT) -> Any:
+        # Re-entrant: a tool that calls another tool is already ON this thread.
+        # Queueing from here would wait for a worker that is busy waiting for us.
+        if threading.get_ident() == self._ident:
+            return fn()
         fut: Future = Future()
         self._q.put((fn, fut))
         return fut.result(timeout=timeout)
@@ -129,16 +135,24 @@ def describe_com_error(exc: BaseException) -> tuple[str, str | None]:
     return msg, hint
 
 
-def com_tool(fn: Callable[..., Any]) -> Callable[..., Any]:
+def com_tool(
+    fn: Callable[..., Any] | None = None, *, timeout: float = DEFAULT_TIMEOUT
+) -> Callable[..., Any]:
     """Decorator for MCP tool functions.
 
     Runs the body on the COM thread and normalises the result to
     {"ok": True, ...} / {"ok": False, "error": ..., "hint": ...}.
+
+    Use `@com_tool(timeout=900)` for surveys that legitimately take minutes;
+    the default guards against Office sitting behind a modal dialog forever.
     """
+    if fn is None:
+        return lambda f: com_tool(f, timeout=timeout)
+    default_timeout = timeout
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        timeout = float(kwargs.pop("_timeout", None) or DEFAULT_TIMEOUT)
+        timeout = float(kwargs.pop("_timeout", None) or default_timeout)
         try:
             result = run(lambda: fn(*args, **kwargs), timeout=timeout)
         except ComToolError as exc:

@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from m365_mcp import (  # noqa: E402
     tools_common as common,
+    tools_research as rs,
     tools_excel as xl,
     tools_misc as misc,
     tools_onenote as one,
@@ -326,6 +327,99 @@ def test_onenote() -> None:
             page_id=pages[0]["id"], max_chars=300))
 
 
+def test_research() -> None:
+    section("research primitives")
+
+    # --- notes in, from each supported format ---
+    md_path = os.path.join(TMP, "notes.md")
+    with open(md_path, "w", encoding="utf-8") as fh:
+        fh.write("# 3Q25 call\n\n- FY26 gross margin guided to 25.5%, from 26%\n"
+                 "- Shipment volume 59mn pairs\n")
+    notes = check("notes_read(md)", rs.notes_read(path=md_path),
+                  expect_keys=("numbered_text",))
+    assert_equal("notes_read numbers the lines", notes.get("lines"), 4)
+    RESULTS.append(("notes_read keeps the citable line prefix",
+                    "   3| - FY26 gross margin" in notes.get("numbered_text", ""), ""))
+    print("[%s] notes_read keeps the citable line prefix"
+          % ("PASS" if "   3| - FY26" in notes.get("numbered_text", "") else "FAIL"))
+
+    for name, path in (("pdf", os.path.join(TMP, "smoke.pdf")),
+                       ("docx", os.path.join(TMP, "smoke.docx"))):
+        if os.path.exists(path):
+            got = check("notes_read(%s)" % name, rs.notes_read(path=path,
+                                                               max_chars=2000))
+            assert_equal("notes_read(%s) routes correctly" % name, got.get("source"),
+                         "pdf" if name == "pdf" else "word")
+    if os.path.exists(os.path.join(TMP, "smoke.pdf")):
+        check("pdf_read_text", rs.pdf_read_text(
+            path=os.path.join(TMP, "smoke.pdf"), pages="1"),
+            expect_keys=("total_pages", "text"))
+
+    # --- a miniature model with the sell-side colour convention ---
+    created = check("excel_new(model)", xl.excel_new(visible=False),
+                    expect_keys=("handle",))
+    h = created.get("handle")
+    if not h:
+        return
+    model_path = os.path.join(TMP, "mini_model.xlsx")
+    try:
+        xl.excel_rename_sheet(sheet=xl.excel_list_sheets(handle=h)["sheets"][0]["name"],
+                              new_name="Model", handle=h)
+        xl.excel_write_range(handle=h, sheet="Model", start_cell="A1",
+                             values=[["Item", 2024, 2025, "2026E"]])
+        xl.excel_write_range(handle=h, sheet="Model", start_cell="A2",
+                             values=[["Revenue", 1000, 1200, None],
+                                     ["Gross margin", 0.25, 0.26, None],
+                                     ["Gross profit", None, None, None]])
+        # green = reported actuals, blue = the analyst's assumptions
+        xl.excel_format_range(range_a1="B2:C3", handle=h, sheet="Model",
+                              font_color="#008000")
+        xl.excel_write_range(handle=h, sheet="Model", start_cell="D2",
+                             values=[[1400], [0.255]])
+        xl.excel_format_range(range_a1="D2:D3", handle=h, sheet="Model",
+                              font_color="#0000FF")
+        xl.excel_write_range(handle=h, sheet="Model", start_cell="B4",
+                             values=[["=B2*B3", "=C2*C3", "=D2*D3"]], as_formula=True)
+        xl.excel_calculate(handle=h)
+        xl.excel_save(handle=h, path=model_path)
+
+        mapped = check("excel_model_map", rs.excel_model_map(handle=h),
+                       expect_keys=("sheets", "colour_legend"))
+        sheet = (mapped.get("sheets") or [{}])[0]
+        assert_equal("model_map finds the period header row",
+                     sheet.get("header_row"), 1)
+        assert_equal("model_map reads the period axis",
+                     sheet.get("periods"), ["2024", "2025", "2026E"])
+        by_cell = {c["cell"]: c for c in sheet.get("cells", [])}
+        assert_equal("model_map classes blue as an assumption",
+                     by_cell.get("D2", {}).get("class"), "assumption")
+        assert_equal("model_map classes green as a reported actual",
+                     by_cell.get("B2", {}).get("class"), "actual")
+        assert_equal("model_map gives a cell its row label",
+                     by_cell.get("D2", {}).get("label"), "Revenue")
+        assert_equal("model_map gives a cell its period",
+                     by_cell.get("D2", {}).get("period"), "2026E")
+        assert_equal("model_map marks assumptions writable",
+                     by_cell.get("D2", {}).get("writable"), True)
+        assert_equal("model_map does not mark actuals writable",
+                     by_cell.get("B2", {}).get("writable"), False)
+
+        traced = check("excel_trace_precedents", rs.excel_trace_precedents(
+            cell="D4", handle=h, sheet="Model"), expect_keys=("tree",))
+        leaves = {n["cell"].split("!")[-1] for n in traced.get("input_leaves", [])}
+        RESULTS.append(("trace_precedents reaches the assumption cells",
+                        {"D2", "D3"} <= leaves, "got %s" % sorted(leaves)))
+        print("[%s] trace_precedents reaches the assumption cells"
+              % ("PASS" if {"D2", "D3"} <= leaves else "FAIL"))
+
+        snap = check("excel_snapshot", rs.excel_snapshot(handle=h, label="test"),
+                     expect_keys=("snapshot",))
+        RESULTS.append(("snapshot file exists", bool(snap.get("exists")), ""))
+        print("[%s] snapshot file exists" % ("PASS" if snap.get("exists") else "FAIL"))
+    finally:
+        check("excel_close(model)", xl.excel_close(handle=h, save=False))
+
+
 def test_access() -> None:
     section("access / publisher (availability only)")
     result = misc.access_list_objects(db_path=os.path.join(TMP, "nonexistent.accdb"))
@@ -353,6 +447,7 @@ def main() -> int:
         ("ppt", test_ppt),
         ("outlook", test_outlook),
         ("onenote", test_onenote),
+        ("research", test_research),
         ("access", test_access),
     ]
     for name, fn in sections:

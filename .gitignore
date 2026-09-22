@@ -18,3 +18,10 @@ notes/
 .DS_Store
 .idea/
 .vscode/
+# reference models / sample workbooks live locally, never in the repo
+*.xlsx
+*.xlsm
+*.xls
+*.docx
+*.pdf
+!docs/**/*.md

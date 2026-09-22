@@ -31,6 +31,7 @@ from . import (
     tools_onenote,
     tools_outlook,
     tools_ppt,
+    tools_research,
     tools_word,
 )
 
@@ -44,11 +45,13 @@ MODULES = (
     tools_outlook,
     tools_onenote,
     tools_misc,
+    tools_research,
 )
 
 FAMILIES = {
     "m365_": "server + application status, handles, file conversion",
-    "excel_": "workbooks, sheets, ranges, formulas, formatting, charts, macros",
+    "excel_": "workbooks, sheets, ranges, formulas, formatting, charts, macros, "
+              "plus model_map / trace_precedents / snapshot for financial models",
     "word_": "documents, text, outline, tables, images, comments, revisions",
     "ppt_": "presentations, slides, shapes, tables, charts, notes, export",
     "outlook_": "mail, folders, search, drafts, calendar, contacts, tasks",
@@ -56,6 +59,8 @@ FAMILIES = {
     "access_": "ADO queries and macros against .accdb/.mdb",
     "publisher_": "publications: read text, export PDF",
     "com_": "generic COM: describe / get / set / call / eval on any object",
+    "notes_": "read notes of any format (md / txt / docx / pdf) into cited lines",
+    "pdf_": "extract text from PDFs",
     "office_": "cross-app file conversion",
 }
 

@@ -11,9 +11,10 @@ object model a VBA macro uses, so the agent edits *your* file, reads *your*
 already-signed-in mailbox, and saves the PDF where you asked. No password, no
 Azure app registration, no network call.
 
-132 tools: Excel, Word, PowerPoint, Outlook, OneNote, Access, Publisher, plus a
+137 tools: Excel, Word, PowerPoint, Outlook, OneNote, Access, Publisher, a
 generic layer that reaches the rest of the object model when no dedicated tool
-exists.
+exists, and a small set of research primitives for working with financial
+models and analyst notes.
 
 ---
 
@@ -82,6 +83,10 @@ Say it normally. These are patterns that work, and what the agent runs:
 | Query an Access db | 「这个 accdb 里 orders 表今年有多少条」 | `access_query`（走 ADO，不开 Access 界面） |
 | Convert anything | 「这几个 docx 都转成 PDF」 | `office_convert` |
 | Something with no tool | 「给这张表加个数据透视」 | `com_describe` → `com_eval` |
+| Read notes of any format | 「把这份纪要读进来」 | `notes_read`（md/docx/pdf 统一入口，带行号） |
+| Understand a model's shape | 「这个模型里哪些格子是假设、哪些是公式」 | `excel_model_map` |
+| Trace a number | 「这个 EPS 是由哪几个假设推出来的」 | `excel_trace_precedents` |
+| Back up before editing | 「改之前先存个快照」 | `excel_snapshot` |
 
 ### What makes a good request here
 
