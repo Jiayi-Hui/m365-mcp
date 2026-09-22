@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# harness entry adapters stay in the mono-repo, not in this package
+CLAUDE.md
+AGENTS.md
+
+# local/sensitive material
+exports/
+raw/
+data/
+outputs/
+notes/
+*.log
+.DS_Store
+.idea/
+.vscode/
