@@ -50,6 +50,29 @@ def check(label: str, result, *, expect_keys: tuple[str, ...] = ()) -> dict:
     return result if isinstance(result, dict) else {}
 
 
+def _norm(value):
+    """Excel hands numbers back as floats; compare on value, not on type."""
+    if isinstance(value, list):
+        return [_norm(v) for v in value]
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float)):
+        return float(value)
+    return value
+
+
+def assert_equal(label: str, actual, expected) -> bool:
+    """Round-trip assertion. Key presence is not evidence that a tool works -
+    excel_write_range once wrote to the wrong cell and every key was still there.
+    """
+    ok = _norm(actual) == _norm(expected)
+    detail = "" if ok else "got %r, want %r" % (actual, expected)
+    RESULTS.append((label, ok, detail))
+    print("[%s] %s %s" % ("PASS" if ok else "FAIL", label,
+                          ("- " + detail[:200]) if detail else ""))
+    return ok
+
+
 def section(name: str) -> None:
     print("\n=== %s ===" % name)
 
@@ -72,15 +95,25 @@ def test_excel() -> None:
     if not h:
         return
     try:
-        check("excel_write_range", xl.excel_write_range(
-            values=[["name", "qty", "price"], ["alpha", 3, 1.5], ["beta", 7, 2.25]],
-            handle=h, start_cell="A1"))
+        grid = [["name", "qty", "price"], ["alpha", 3, 1.5], ["beta", 7, 2.25]]
+        wrote = check("excel_write_range", xl.excel_write_range(
+            values=grid, handle=h, start_cell="A1"))
+        assert_equal("excel_write_range lands on A1:C3", wrote.get("address"), "A1:C3")
         check("excel_write_range(formula)", xl.excel_write_range(
             values=[["=B2*C2"], ["=B3*C3"]], handle=h, start_cell="D2",
             as_formula=True))
         check("excel_calculate", xl.excel_calculate(handle=h))
-        read = check("excel_read_range", xl.excel_read_range(handle=h, mode="values"),
-                     expect_keys=("values",))
+
+        # Round-trip: the written block must come back cell for cell.
+        back = check("excel_read_range", xl.excel_read_range(
+            handle=h, range_a1="A1:C3", mode="values"), expect_keys=("values",))
+        assert_equal("excel round-trip values", back.get("values"), grid)
+        assert_equal("excel round-trip address", back.get("address"), "A1:C3")
+        computed = xl.excel_read_range(handle=h, range_a1="D2:D3", mode="values")
+        assert_equal("excel formulas evaluate", computed.get("values"),
+                     [[4.5], [15.75]])
+        read = check("excel_read_range(used)", xl.excel_read_range(
+            handle=h, mode="values"), expect_keys=("values",))
         print("    values:", json.dumps(read.get("values"), default=str)[:160])
         formulas = check("excel_read_range(formulas)",
                          xl.excel_read_range(handle=h, range_a1="D2:D3",
@@ -90,8 +123,13 @@ def test_excel() -> None:
             range_a1="A1:D1", handle=h, bold=True, fill_color="#DDEBF7",
             borders=True))
         check("excel_autofit", xl.excel_autofit(handle=h))
-        check("excel_append_rows", xl.excel_append_rows(
+        appended = check("excel_append_rows", xl.excel_append_rows(
             values=[["gamma", 5, 3.0]], handle=h))
+        assert_equal("excel_append_rows lands below the last row",
+                     appended.get("address"), "A4:C4")
+        assert_equal("excel_append_rows content",
+                     xl.excel_read_range(handle=h, range_a1="A4:C4").get("values"),
+                     [["gamma", 5, 3.0]])
         check("excel_add_sheet", xl.excel_add_sheet(name="Notes", handle=h))
         check("excel_list_sheets", xl.excel_list_sheets(handle=h),
               expect_keys=("sheets",))
@@ -153,8 +191,10 @@ def test_word() -> None:
             values=[["item", "value"], ["latency", "12ms"], ["rows", "3"]],
             handle=h))
         check("word_list_tables", wd.word_list_tables(handle=h))
-        check("word_read_table", wd.word_read_table(table_index=1, handle=h),
-              expect_keys=("values",))
+        tbl = check("word_read_table", wd.word_read_table(table_index=1, handle=h),
+                    expect_keys=("values",))
+        assert_equal("word table round-trip", tbl.get("values"),
+                     [["item", "value"], ["latency", "12ms"], ["rows", "3"]])
         check("word_get_outline", wd.word_get_outline(handle=h),
               expect_keys=("headings",))
         check("word_replace_text", wd.word_replace_text(
@@ -212,8 +252,14 @@ def test_ppt() -> None:
             width=420, height=260))
         check("ppt_set_notes", pp.ppt_set_notes(
             index=1, text="speaker notes from COM", handle=h))
-        check("ppt_list_slides", pp.ppt_list_slides(handle=h),
-              expect_keys=("slides",))
+        listed = check("ppt_list_slides", pp.ppt_list_slides(handle=h),
+                       expect_keys=("slides",))
+        assert_equal("ppt slide titles",
+                     [s.get("title") for s in listed.get("slides", [])],
+                     ["M365 MCP smoke test", "Agenda"])
+        assert_equal("ppt speaker notes",
+                     (listed.get("slides") or [{}])[0].get("notes"),
+                     "speaker notes from COM")
         check("ppt_list_shapes", pp.ppt_list_shapes(slide=2, handle=h))
         check("ppt_duplicate_slide", pp.ppt_duplicate_slide(index=2, handle=h))
         check("ppt_move_slide", pp.ppt_move_slide(index=3, to_index=1, handle=h))
@@ -255,6 +301,9 @@ def test_outlook() -> None:
         to="", subject="[m365-mcp smoke test] draft", body="not sent"),
         expect_keys=("entry_id",))
     if draft.get("entry_id"):
+        fetched = ol.outlook_get_message(entry_id=draft["entry_id"], max_chars=200)
+        assert_equal("outlook draft round-trip subject", fetched.get("subject"),
+                     "[m365-mcp smoke test] draft")
         unsent = ol.outlook_send_draft(entry_id=draft["entry_id"])
         RESULTS.append(("outlook_send_draft refuses without confirm",
                         unsent.get("ok") is False, ""))

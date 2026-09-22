@@ -150,6 +150,23 @@ def _addr(rng: Any, absolute: bool = False) -> str:
         return text if absolute else text.replace("$", "")
 
 
+def _resize(rng: Any, rows: int, cols: int) -> Any:
+    """Grow a range to rows x cols, anchored at its top-left cell.
+
+    `Range.Resize` is a parameterised property, and late binding evaluates the
+    property first: rng.Resize(2, 3) becomes rng.Resize (-> the same range) and
+    then Item(2, 3) -> the SINGLE cell two rows down and three columns across.
+    No error, just data written to the wrong place. So build the block from its
+    corners instead; Worksheet.Cells(r, c) resolves to Item(r, c), which is what
+    we actually want.
+    """
+    ws = rng.Worksheet
+    top, left = int(rng.Row), int(rng.Column)
+    return ws.Range(
+        ws.Cells(top, left), ws.Cells(top + int(rows) - 1, left + int(cols) - 1)
+    )
+
+
 def _grid(value: Any) -> list[list[Any]]:
     """Range.Value/Value2 -> list of rows (a single cell comes back scalar)."""
     if value is None:
@@ -444,7 +461,7 @@ def excel_read_range(
     truncated = False
     if n_rows * n_cols > max_cells:
         keep = max(1, max_cells // max(1, n_cols))
-        rng = rng.Resize(keep, n_cols)
+        rng = _resize(rng, keep, n_cols)
         truncated = True
     if mode == "display":
         data = _grid(rng.Text if n_rows * n_cols == 1 else rng.Value)
@@ -497,7 +514,7 @@ def excel_write_range(
     ws = _sheet(wb, sheet)
     grid = _to_com_grid(values)
     rows, cols = len(grid), len(grid[0])
-    rng = ws.Range(start_cell).Resize(rows, cols)
+    rng = _resize(ws.Range(start_cell), rows, cols)
     payload = tuple(tuple(r) for r in grid)
     if as_formula:
         rng.Formula = payload
@@ -526,8 +543,8 @@ def excel_append_rows(
     used_empty = _addr(ws.UsedRange) == "A1" and not ws.Range("A1").Value
     start_row = 1 if used_empty else int(last) + 1
     grid = _to_com_grid(values)
-    rng = ws.Cells(start_row, ws.Range(column + "1").Column).Resize(
-        len(grid), len(grid[0])
+    rng = _resize(
+        ws.Cells(start_row, ws.Range(column + "1").Column), len(grid), len(grid[0])
     )
     rng.Value = tuple(tuple(r) for r in grid)
     return {"sheet": ws.Name, "address": _addr(rng), "rows": len(grid)}
