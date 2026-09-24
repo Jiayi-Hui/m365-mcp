@@ -1141,6 +1141,298 @@ def excel_apply_changeset(
 
 
 @com_tool(timeout=600)
+def excel_proposal_sheet(
+    proposals: list,
+    handle: str | None = None,
+    sheet_name: str = "AI_Proposals",
+    visible: bool = True,
+    replace: bool = True,
+) -> dict[str, Any]:
+    """Build an approval sheet inside the workbook: one row per proposed edit,
+    with a tick box the analyst fills in without leaving Excel.
+
+    A comment tells you something; it gives you nothing to approve. This lays
+    the proposals out as a table - target cell (hyperlinked), what the cell
+    means, current value, proposed value, the basis, the derivation, the source,
+    and how many cells depend on it - with an APPROVE column to mark `Y`.
+    `excel_apply_approved` then applies only the ticked rows.
+
+    Each proposal:
+        {"sheet": "Breakdown", "cell": "Y15", "proposed": 261.65,
+         "basis": "arithmetic",          # arithmetic | rule | judgement
+         "label": "Outdoor footwear x 1H25",
+         "derivation": "194.79 / (1 - 25.55%) = 261.64; segments must sum to 12,649.04",
+         "source": "2026H1 report p15"}
+
+    `basis` is the honest part. `arithmetic` has one correct answer and can be
+    approved on sight; `rule` carries an assumption that must be agreed with
+    first; `judgement` should not carry a number at all - leave `proposed` empty
+    and let the row state the reconciliation instead.
+
+    Nothing is written to the model and the file is not saved.
+    """
+    if not isinstance(proposals, list) or not proposals:
+        raise ComToolError("proposals must be a non-empty list")
+    wb = _wb(handle)
+    app = wb.Application
+    try:
+        app.Visible = bool(visible)
+    except Exception:  # noqa: BLE001
+        pass
+
+    existing = None
+    for ws in wb.Worksheets:
+        if str(ws.Name).lower() == sheet_name.lower():
+            existing = ws
+            break
+    if existing is not None:
+        if not replace:
+            raise ComToolError(
+                "Sheet %r already exists" % sheet_name,
+                hint="Pass replace=true to rebuild it.")
+        existing.Delete()
+    ws = wb.Worksheets.Add(Before=wb.Worksheets(1))
+    ws.Name = sheet_name
+
+    headers = ["#", "APPROVE", "Target", "What it is", "Current", "Proposed",
+               "Basis", "Derivation / reconciliation", "Source", "Dependents",
+               "Status"]
+    for c, text in enumerate(headers, start=1):
+        cell = ws.Cells(1, c)
+        cell.Value = text
+        cell.Font.Bold = True
+        cell.Interior.Color = 0x703030          # BGR: dark slate
+        cell.Font.Color = 0xFFFFFF
+
+    basis_colour = {"arithmetic": 0xD9F2D9,     # green - safe to approve
+                    "rule": 0x9CDCFF,           # amber - agree the rule first
+                    "judgement": 0xF0F0F0}      # grey  - no number offered
+    rows = []
+    for i, item in enumerate(proposals, start=1):
+        if not isinstance(item, dict) or not item.get("cell"):
+            continue
+        r = i + 1
+        target_sheet = str(item.get("sheet") or "")
+        target = "%s!%s" % (target_sheet, item["cell"]) if target_sheet \
+            else str(item["cell"])
+        current = None
+        dependents = None
+        has_formula = None
+        try:
+            tws = _sheet(wb, target_sheet or None)
+            rng = tws.Range(item["cell"])
+            current = jsonable(rng.Value)
+            has_formula = bool(rng.HasFormula)
+            if has_formula:
+                current = jsonable(rng.Formula)
+            try:
+                dependents = int(rng.Dependents.Count)
+            except Exception:  # noqa: BLE001
+                dependents = 0
+        except Exception as exc:  # noqa: BLE001
+            current = "?? %s" % str(exc)[:40]
+
+        basis = str(item.get("basis", "judgement")).lower()
+        ws.Cells(r, 1).Value = i
+        ws.Cells(r, 2).Value = ""
+        ws.Cells(r, 3).Value = target
+        try:
+            ws.Hyperlinks.Add(Anchor=ws.Cells(r, 3), Address="",
+                              SubAddress=target, TextToDisplay=target)
+        except Exception:  # noqa: BLE001 - sheet names with spaces etc.
+            pass
+        ws.Cells(r, 4).Value = item.get("label")
+        ws.Cells(r, 5).Value = current
+        proposed = item.get("proposed")
+        ws.Cells(r, 6).Value = "" if proposed is None else proposed
+        ws.Cells(r, 7).Value = basis
+        ws.Cells(r, 8).Value = item.get("derivation")
+        ws.Cells(r, 9).Value = item.get("source")
+        ws.Cells(r, 10).Value = dependents
+        ws.Cells(r, 11).Value = "pending" if proposed is not None else "info only"
+        colour = basis_colour.get(basis, 0xF0F0F0)
+        ws.Range(ws.Cells(r, 1), ws.Cells(r, 11)).Interior.Color = colour
+        if has_formula:
+            ws.Cells(r, 5).Font.Italic = True
+        rows.append({"row": r, "target": target, "basis": basis,
+                     "proposed": jsonable(proposed), "dependents": dependents,
+                     "is_formula": has_formula})
+
+    # tick box: a two-value dropdown beats free text
+    if rows:
+        box = ws.Range(ws.Cells(2, 2), ws.Cells(len(rows) + 1, 2))
+        try:
+            box.Validation.Delete()
+            box.Validation.Add(Type=3, AlertStyle=1, Operator=1, Formula1="Y,N")
+            box.Validation.InCellDropdown = True
+        except Exception:  # noqa: BLE001
+            pass
+        box.HorizontalAlignment = -4108
+        box.Font.Bold = True
+
+    for c, width in ((1, 5), (2, 10), (3, 20), (4, 34), (5, 16), (6, 14),
+                     (7, 12), (8, 62), (9, 30), (10, 11), (11, 12)):
+        ws.Columns(c).ColumnWidth = width
+    ws.Range("H:H").WrapText = True
+    ws.Rows(1).AutoFilter()
+    try:
+        ws.Activate()
+        app.ActiveWindow.SplitRow = 1
+        app.ActiveWindow.FreezePanes = True
+    except Exception:  # noqa: BLE001
+        pass
+
+    counts: dict[str, int] = {}
+    for row in rows:
+        counts[row["basis"]] = counts.get(row["basis"], 0) + 1
+    return {
+        "sheet": sheet_name,
+        "rows": rows,
+        "by_basis": counts,
+        "saved": False,
+        "how_to_use": (
+            "Open the %s tab, put Y in the APPROVE column for the rows you "
+            "accept, then ask to apply the approved proposals. Green rows are "
+            "arithmetic - one correct answer, safe to approve on sight. Amber "
+            "rows carry an assumption stated in the Derivation column: agree "
+            "with that first. Grey rows offer no number on purpose." % sheet_name
+        ),
+    }
+
+
+@com_tool(timeout=600)
+def excel_apply_approved(
+    handle: str | None = None,
+    sheet_name: str = "AI_Proposals",
+    confirm: bool = False,
+    snapshot: bool = True,
+    annotate: bool = True,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Apply the proposal rows the analyst ticked `Y`, and nothing else.
+
+    Runs the same guards as excel_apply_changeset: a formula target is refused,
+    a missing data add-in refuses the whole run, a snapshot is taken first, and
+    each edited cell keeps a comment with the derivation, the source and its
+    previous value. The Status column is written back so the sheet becomes the
+    record of what was done.
+    """
+    wb = _wb(handle)
+    ws = None
+    for candidate in wb.Worksheets:
+        if str(candidate.Name).lower() == sheet_name.lower():
+            ws = candidate
+            break
+    if ws is None:
+        raise ComToolError(
+            "No %r sheet in this workbook" % sheet_name,
+            hint="Build one with excel_proposal_sheet first.")
+
+    last = int(ws.UsedRange.Rows.Count)
+    approved, skipped = [], []
+    for r in range(2, last + 1):
+        target = ws.Cells(r, 3).Value
+        if not target:
+            continue
+        mark = str(ws.Cells(r, 2).Value or "").strip().upper()
+        proposed = ws.Cells(r, 6).Value
+        if mark != "Y":
+            skipped.append({"row": r, "target": str(target),
+                            "reason": "not approved" if mark != "N" else "marked N"})
+            continue
+        if proposed is None or proposed == "":
+            skipped.append({"row": r, "target": str(target),
+                            "reason": "no proposed value on this row"})
+            continue
+        approved.append({
+            "row": r, "target": str(target), "proposed": proposed,
+            "basis": str(ws.Cells(r, 7).Value or ""),
+            "derivation": str(ws.Cells(r, 8).Value or ""),
+            "source": str(ws.Cells(r, 9).Value or ""),
+        })
+
+    if not confirm:
+        return {
+            "ok": False,
+            "error": "confirm=False - nothing was written",
+            "approved_rows": len(approved),
+            "skipped_rows": len(skipped),
+            "preview": [
+                {"target": a["target"], "to": jsonable(a["proposed"]),
+                 "basis": a["basis"]} for a in approved[:20]],
+            "hint": "Show the preview, then call again with confirm=true.",
+        }
+    if not approved:
+        return {"written": 0, "approved_rows": 0, "skipped": skipped,
+                "note": "No row was marked Y."}
+
+    sources = excel_data_sources(handle=handle)
+    if sources.get("verdict") == "read_only_recommended" and not force:
+        return {
+            "ok": False,
+            "error": "workbook depends on add-ins that are not loaded: %s"
+                     % ", ".join(sources.get("addins_missing", [])),
+            "reasons": sources.get("reasons", []),
+            "hint": "Applying is fine in memory, but this workbook must not be "
+                    "saved in this state. Load the add-in, or pass force=true "
+                    "if you will not save.",
+        }
+
+    snap = None
+    if snapshot:
+        snap = excel_snapshot(handle=handle, label="pre-approved")
+        if not snap.get("ok", True):
+            return snap
+
+    written, failed = [], []
+    for item in approved:
+        target = item["target"]
+        try:
+            sheet_ref, _, cell_ref = target.rpartition("!")
+            tws = _sheet(wb, sheet_ref or None)
+            rng = tws.Range(cell_ref)
+            if bool(rng.HasFormula):
+                failed.append({"target": target,
+                               "error": "target holds a formula: %s"
+                                        % str(rng.Formula)[:70]})
+                ws.Cells(item["row"], 11).Value = "refused: formula"
+                continue
+            before = jsonable(rng.Value)
+            rng.Value = item["proposed"]
+            if annotate:
+                text = "[AI] %s applied\n%s\nsource: %s\nwas: %s" % (
+                    _dt.datetime.now().strftime("%Y-%m-%d"),
+                    item["derivation"] or "(no derivation recorded)",
+                    item["source"] or "(no source recorded)", before)
+                try:
+                    if rng.Comment is not None:
+                        rng.Comment.Delete()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    rng.AddComment(text[:1200])
+                except Exception:  # noqa: BLE001
+                    pass
+            ws.Cells(item["row"], 11).Value = "applied %s" % \
+                _dt.datetime.now().strftime("%H:%M")
+            written.append({"target": target, "from": before,
+                            "to": jsonable(item["proposed"])})
+        except Exception as exc:  # noqa: BLE001
+            failed.append({"target": target, "error": str(exc)[:160]})
+            ws.Cells(item["row"], 11).Value = "failed"
+
+    return {
+        "written": len(written),
+        "cells": written,
+        "failed": failed,
+        "skipped": skipped,
+        "snapshot": snap.get("snapshot") if snap else None,
+        "note": "Workbook edited in memory and NOT saved. Recalculate and check "
+                "the outputs before deciding whether to save.",
+    }
+
+
+@com_tool(timeout=600)
 def excel_annotate(
     annotations: list,
     handle: str | None = None,
@@ -1149,6 +1441,7 @@ def excel_annotate(
     visible: bool = True,
     prefix: str = "[AI]",
     replace_existing: bool = True,
+    on_existing: str = "skip",
     save: bool = False,
 ) -> dict[str, Any]:
     """Put the agent's findings ON the cells, in the analyst's own Excel window.
@@ -1168,6 +1461,14 @@ def excel_annotate(
     workbook stays open with the annotations visible, while the file on disk is
     untouched, so the add-in's cached values cannot be destroyed. The analyst
     reads the notes in the live window and decides what to do.
+
+    `on_existing` governs cells that already carry somebody else's note - and in
+    a maintained model there are many: sourcing ("ML forecast", "Adidas annual
+    report"), call notes dated by month, fiscal-calendar definitions. Those took
+    real work and their Author is part of the record, so the default `skip`
+    leaves them completely untouched (the cell is still highlighted, and the
+    collision is reported back). `append` adds below the original text, losing
+    the original Author; nothing ever overwrites another person's note.
     """
     if not isinstance(annotations, list) or not annotations:
         raise ComToolError("annotations must be a non-empty list")
@@ -1190,7 +1491,9 @@ def excel_annotate(
         "low": 0xD9F2D9,         # soft green
         "info": 0xF2E6D9,
     }
-    written, failed = [], []
+    if on_existing not in ("skip", "append"):
+        raise ComToolError("on_existing must be 'skip' or 'append'")
+    written, failed, skipped = [], [], []
     for item in annotations:
         if not isinstance(item, dict) or not item.get("cell"):
             failed.append({"item": jsonable(item), "error": "needs a 'cell'"})
@@ -1211,18 +1514,34 @@ def excel_annotate(
                 existing = None
             if existing is not None:
                 old = str(existing.Text())
-                if replace_existing and prefix in old:
+                author = ""
+                try:
+                    author = str(existing.Author or "")
+                except Exception:  # noqa: BLE001
+                    pass
+                mine = prefix in old
+                if mine and replace_existing:
                     existing.Delete()
-                    existing = None
-                elif not replace_existing:
+                elif mine:
                     body = old + "\n---\n" + body
                     existing.Delete()
-                    existing = None
                 else:
-                    # somebody else's note: keep it, append below
-                    body = old + "\n---\n" + body
+                    # An analyst's own note. These carry sourcing, call notes and
+                    # definitions that took real work; rewriting the comment
+                    # would also drop its Author. Leave it completely alone.
+                    if on_existing == "skip":
+                        skipped.append({
+                            "cell": "%s!%s" % (ws.Name, item["cell"]),
+                            "existing_author": author,
+                            "existing_text": old.strip()[:160],
+                            "reason": "cell already has a note from someone else; "
+                                      "not overwritten",
+                        })
+                        if highlight and severity in severity_colour:
+                            rng.Interior.Color = severity_colour[severity]
+                        continue
+                    body = old.rstrip() + "\n---\n" + body
                     existing.Delete()
-                    existing = None
             rng.AddComment(body[:1800])
             try:
                 rng.Comment.Shape.TextFrame.AutoSize = True
@@ -1246,6 +1565,7 @@ def excel_annotate(
             return {
                 "annotated": written,
                 "failed": failed,
+                "skipped_existing_notes": skipped,
                 "saved": False,
                 "ok": False,
                 "error": "annotations applied in memory but NOT saved: %s"
@@ -1261,10 +1581,12 @@ def excel_annotate(
         "handle": handle,
         "annotated": written,
         "failed": failed,
+        "skipped_existing_notes": skipped,
         "saved": saved,
         "note": "Comments and highlighting are in the open workbook; the file "
                 "on disk is unchanged. Review in Excel, then save yourself if "
-                "you want to keep them.",
+                "you want to keep them. Cells already carrying someone else's "
+                "note were highlighted but not written to.",
     }
 
 
@@ -1701,4 +2023,6 @@ TOOLS = [
     excel_model_check,
     excel_annotate,
     excel_clear_annotations,
+    excel_proposal_sheet,
+    excel_apply_approved,
 ]
