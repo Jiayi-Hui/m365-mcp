@@ -25,6 +25,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from . import (
+    prompts,
     tools_common,
     tools_excel,
     tools_misc,
@@ -108,12 +109,13 @@ def m365_help(family: str | None = None) -> dict[str, Any]:
 
 
 def register(server: FastMCP | None = None) -> FastMCP:
-    """Register every tool on a FastMCP instance (defaults to the module one)."""
+    """Register every tool and workflow prompt on a FastMCP instance."""
     target = server or mcp
     target.tool()(m365_help)
     for module in MODULES:
         for fn in module.TOOLS:
             target.tool()(fn)
+    prompts.register(target)
     return target
 
 
