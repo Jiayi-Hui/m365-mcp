@@ -11,7 +11,7 @@ object model a VBA macro uses, so the agent edits *your* file, reads *your*
 already-signed-in mailbox, and saves the PDF where you asked. No password, no
 Azure app registration, no network call.
 
-142 tools: Excel, Word, PowerPoint, Outlook, OneNote, Access, Publisher, a
+144 tools: Excel, Word, PowerPoint, Outlook, OneNote, Access, Publisher, a
 generic layer that reaches the rest of the object model when no dedicated tool
 exists, and a small set of research primitives for working with financial
 models and analyst notes.
@@ -92,6 +92,8 @@ Say it normally. These are patterns that work, and what the agent runs:
 | Check a model before trusting it | 「这个模型有没有问题」 | `excel_model_check` |
 | See what live data it depends on | 「这模型依赖 Wind 吗，现在能用吗」 | `excel_data_sources` |
 | Free Office before installing something | 「Excel 好像还占着，清一下」 | `m365_release` |
+| Put the findings on the cells themselves | 「把结论标到对应格子上，我在 Excel 里看」 | `excel_annotate`（写批注+底色，不改值、不保存） |
+| Remove those marks again | 「把 AI 加的批注清掉」 | `excel_clear_annotations` |
 
 ### What makes a good request here
 

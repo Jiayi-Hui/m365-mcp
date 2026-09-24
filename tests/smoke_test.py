@@ -475,6 +475,37 @@ def test_research() -> None:
         print("[%s] apply left an audit comment"
               % ("PASS" if "guidance cut" in str(info.get("comment", "")) else "FAIL"))
 
+        # --- annotate: findings land ON the cell, and nothing is saved ---
+        before_saved = common.com_get(path="Saved", handle=h).get("value")
+        ann = check("excel_annotate", rs.excel_annotate(
+            handle=h, visible=False, annotations=[
+                {"sheet": "Model", "cell": "D2", "severity": "high",
+                 "text": "guidance implies a lower FY26 number",
+                 "source": "notes line 3"},
+                {"sheet": "Model", "cell": "D4", "severity": "medium",
+                 "text": "this is a formula - change its drivers instead"},
+            ]), expect_keys=("annotated",))
+        assert_equal("annotate writes both notes", len(ann.get("annotated", [])), 2)
+        assert_equal("annotate does not save", ann.get("saved"), False)
+        noted = xl.excel_cell_info(cell="D2", handle=h, sheet="Model")
+        RESULTS.append(("annotation is readable on the cell",
+                        "guidance implies" in str(noted.get("comment", "")), ""))
+        print("[%s] annotation is readable on the cell"
+              % ("PASS" if "guidance implies" in str(noted.get("comment", ""))
+                 else "FAIL"))
+        assert_equal("annotate leaves the cell value alone",
+                     xl.excel_read_range(handle=h, sheet="Model",
+                                         range_a1="D2").get("values"), [[1500]])
+        cleared = check("excel_clear_annotations",
+                        rs.excel_clear_annotations(handle=h, sheets="Model"))
+        assert_equal("clear removes both", cleared.get("count"), 2)
+        gone = xl.excel_cell_info(cell="D2", handle=h, sheet="Model")
+        RESULTS.append(("annotation is gone after clearing",
+                        "guidance implies" not in str(gone.get("comment", "")), ""))
+        print("[%s] annotation is gone after clearing"
+              % ("PASS" if "guidance implies" not in str(gone.get("comment", ""))
+                 else "FAIL"))
+
         # --- data sources: clean model needs no add-in ---
         clean = check("excel_data_sources(clean)", rs.excel_data_sources(handle=h),
                       expect_keys=("verdict",))

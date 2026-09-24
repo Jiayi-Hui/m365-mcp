@@ -1140,6 +1140,172 @@ def excel_apply_changeset(
     }
 
 
+@com_tool(timeout=600)
+def excel_annotate(
+    annotations: list,
+    handle: str | None = None,
+    path: str | None = None,
+    highlight: bool = True,
+    visible: bool = True,
+    prefix: str = "[AI]",
+    replace_existing: bool = True,
+    save: bool = False,
+) -> dict[str, Any]:
+    """Put the agent's findings ON the cells, in the analyst's own Excel window.
+
+    This is the delivery step for model work. A model is maintained by looking
+    at the grid, so a finding that lives in a chat log or a separate document is
+    a finding the analyst has to re-locate by hand. Here it arrives attached to
+    the cell it is about: hover, read the evidence, decide, edit in place.
+
+    Each annotation is a dict:
+        {"sheet": "Breakdown", "cell": "Y15",
+         "text": "1H25 should be ~261.65, not 2,616.49 (10x)...",
+         "severity": "high"}
+
+    **It writes comments and cell colour, never values, and by default it does
+    not save.** That matters on a machine whose data add-in is missing: the
+    workbook stays open with the annotations visible, while the file on disk is
+    untouched, so the add-in's cached values cannot be destroyed. The analyst
+    reads the notes in the live window and decides what to do.
+    """
+    if not isinstance(annotations, list) or not annotations:
+        raise ComToolError("annotations must be a non-empty list")
+    if path and not handle:
+        opened = excel_open(path=path, read_only=False, visible=visible,
+                            update_links=False)
+        if not opened.get("ok", True):
+            return opened
+        handle = opened["handle"]
+
+    wb = _wb(handle)
+    try:
+        wb.Application.Visible = bool(visible)
+    except Exception:  # noqa: BLE001
+        pass
+
+    severity_colour = {          # Interior colour is BGR
+        "high": 0x9CA0FF,        # soft red
+        "medium": 0x9CDCFF,      # soft amber
+        "low": 0xD9F2D9,         # soft green
+        "info": 0xF2E6D9,
+    }
+    written, failed = [], []
+    for item in annotations:
+        if not isinstance(item, dict) or not item.get("cell"):
+            failed.append({"item": jsonable(item), "error": "needs a 'cell'"})
+            continue
+        try:
+            ws = _sheet(wb, item.get("sheet"))
+            rng = ws.Range(item["cell"])
+            severity = str(item.get("severity", "info")).lower()
+            body = "%s %s\n%s" % (
+                prefix, _dt.datetime.now().strftime("%Y-%m-%d"),
+                str(item.get("text", "")).strip())
+            if item.get("source"):
+                body += "\nsource: %s" % item["source"]
+            existing = None
+            try:
+                existing = rng.Comment
+            except Exception:  # noqa: BLE001
+                existing = None
+            if existing is not None:
+                old = str(existing.Text())
+                if replace_existing and prefix in old:
+                    existing.Delete()
+                    existing = None
+                elif not replace_existing:
+                    body = old + "\n---\n" + body
+                    existing.Delete()
+                    existing = None
+                else:
+                    # somebody else's note: keep it, append below
+                    body = old + "\n---\n" + body
+                    existing.Delete()
+                    existing = None
+            rng.AddComment(body[:1800])
+            try:
+                rng.Comment.Shape.TextFrame.AutoSize = True
+            except Exception:  # noqa: BLE001
+                pass
+            if highlight and severity in severity_colour:
+                rng.Interior.Color = severity_colour[severity]
+            written.append({
+                "cell": "%s!%s" % (ws.Name, item["cell"]),
+                "severity": severity,
+                "current_value": jsonable(rng.Value),
+                "has_formula": bool(rng.HasFormula),
+            })
+        except Exception as exc:  # noqa: BLE001
+            failed.append({"cell": item.get("cell"), "error": str(exc)[:160]})
+
+    saved = False
+    if save:
+        sources = excel_data_sources(handle=handle)
+        if sources.get("verdict") == "read_only_recommended":
+            return {
+                "annotated": written,
+                "failed": failed,
+                "saved": False,
+                "ok": False,
+                "error": "annotations applied in memory but NOT saved: %s"
+                         % ", ".join(sources.get("addins_missing", [])),
+                "hint": "Saving now would bake the add-in's #NAME? cells into "
+                        "the file. Leave the window open and review there.",
+            }
+        wb.Save()
+        saved = True
+
+    return {
+        "workbook": str(getattr(wb, "FullName", wb.Name)),
+        "handle": handle,
+        "annotated": written,
+        "failed": failed,
+        "saved": saved,
+        "note": "Comments and highlighting are in the open workbook; the file "
+                "on disk is unchanged. Review in Excel, then save yourself if "
+                "you want to keep them.",
+    }
+
+
+@com_tool(timeout=300)
+def excel_clear_annotations(
+    handle: str | None = None,
+    sheets: str | None = None,
+    prefix: str = "[AI]",
+    clear_highlight: bool = True,
+) -> dict[str, Any]:
+    """Remove annotations this server added, leaving anyone else's comments."""
+    wb = _wb(handle)
+    wanted = None
+    if sheets:
+        wanted = {s.strip().lower() for s in sheets.split(",") if s.strip()}
+    removed = []
+    for ws in wb.Worksheets:
+        if wanted and str(ws.Name).lower() not in wanted:
+            continue
+        try:
+            comments = ws.Comments
+            count = int(comments.Count)
+        except Exception:  # noqa: BLE001
+            continue
+        for i in range(count, 0, -1):
+            try:
+                comment = comments(i)
+                if prefix not in str(comment.Text()):
+                    continue
+                cell = comment.Parent
+                addr = "%s!%s" % (ws.Name, str(cell.Address).replace("$", ""))
+                comment.Delete()
+                if clear_highlight:
+                    cell.Interior.ColorIndex = -4142  # xlColorIndexNone
+                removed.append(addr)
+            except Exception:  # noqa: BLE001
+                continue
+    return {"removed": removed, "count": len(removed),
+            "note": "Workbook not saved; close without saving to revert fully."}
+
+
 @com_tool(timeout=900)
 def excel_model_check(
     path: str | None = None,
@@ -1533,4 +1699,6 @@ TOOLS = [
     excel_apply_changeset,
     excel_data_sources,
     excel_model_check,
+    excel_annotate,
+    excel_clear_annotations,
 ]
