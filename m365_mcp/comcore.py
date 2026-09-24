@@ -169,7 +169,7 @@ def com_tool(
                 "ok": False,
                 "error": type(exc).__name__ + ": " + message,
                 "hint": hint,
-                "traceback": traceback.format_exc(limit=4),
+                "traceback": traceback.format_exc(limit=14),
             }
         if isinstance(result, dict):
             result.setdefault("ok", True)

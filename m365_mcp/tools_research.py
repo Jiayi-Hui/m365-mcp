@@ -98,6 +98,18 @@ def _looks_like_period(value: Any) -> bool:
     return bool(_PERIOD_RE.match(str(value)))
 
 
+def _as_text(value: Any) -> Any:
+    """Make a string safe to put in a cell as literal text.
+
+    Excel parses anything starting with = + - @ as a formula, so a note that
+    quotes a formula ("=Y31/1.0614, back-solved from 1H25") raises 0x800A03EC
+    on assignment. A leading apostrophe forces text and is not displayed.
+    """
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@"):
+        return "'" + value
+    return value
+
+
 def _col_letter(index: int) -> str:
     """1 -> A, 27 -> AA. Cheaper than asking Excel for the address."""
     letters = ""
@@ -1241,13 +1253,13 @@ def excel_proposal_sheet(
                               SubAddress=target, TextToDisplay=target)
         except Exception:  # noqa: BLE001 - sheet names with spaces etc.
             pass
-        ws.Cells(r, 4).Value = item.get("label")
-        ws.Cells(r, 5).Value = current
+        ws.Cells(r, 4).Value = _as_text(item.get("label"))
+        ws.Cells(r, 5).Value = _as_text(current)
         proposed = item.get("proposed")
         ws.Cells(r, 6).Value = "" if proposed is None else proposed
         ws.Cells(r, 7).Value = basis
-        ws.Cells(r, 8).Value = item.get("derivation")
-        ws.Cells(r, 9).Value = item.get("source")
+        ws.Cells(r, 8).Value = _as_text(item.get("derivation"))
+        ws.Cells(r, 9).Value = _as_text(item.get("source"))
         ws.Cells(r, 10).Value = dependents
         ws.Cells(r, 11).Value = "pending" if proposed is not None else "info only"
         colour = basis_colour.get(basis, 0xF0F0F0)
@@ -1270,17 +1282,28 @@ def excel_proposal_sheet(
         box.HorizontalAlignment = -4108
         box.Font.Bold = True
 
+    # Cosmetics. None of this is worth failing the whole call for, and Excel
+    # rejects some of it depending on the sheet's state (AutoFilter in
+    # particular), so each step stands alone.
+    cosmetic_errors = []
     for c, width in ((1, 5), (2, 10), (3, 20), (4, 34), (5, 16), (6, 14),
                      (7, 12), (8, 62), (9, 30), (10, 11), (11, 12)):
-        ws.Columns(c).ColumnWidth = width
-    ws.Range("H:H").WrapText = True
-    ws.Rows(1).AutoFilter()
-    try:
-        ws.Activate()
-        app.ActiveWindow.SplitRow = 1
-        app.ActiveWindow.FreezePanes = True
-    except Exception:  # noqa: BLE001
-        pass
+        try:
+            ws.Columns(c).ColumnWidth = width
+        except Exception as exc:  # noqa: BLE001
+            cosmetic_errors.append("width col %d: %s" % (c, str(exc)[:60]))
+    for step, action in (
+        ("wrap", lambda: setattr(ws.Range("H:H"), "WrapText", True)),
+        ("autofilter", lambda: ws.Range(
+            ws.Cells(1, 1), ws.Cells(max(2, len(rows) + 1), 11)).AutoFilter()),
+        ("activate", lambda: ws.Activate()),
+        ("freeze", lambda: (setattr(app.ActiveWindow, "SplitRow", 1),
+                            setattr(app.ActiveWindow, "FreezePanes", True))),
+    ):
+        try:
+            action()
+        except Exception as exc:  # noqa: BLE001
+            cosmetic_errors.append("%s: %s" % (step, str(exc)[:60]))
 
     counts: dict[str, int] = {}
     for row in rows:
@@ -1289,6 +1312,7 @@ def excel_proposal_sheet(
         "sheet": sheet_name,
         "rows": rows,
         "by_basis": counts,
+        "cosmetic_warnings": cosmetic_errors,
         "saved": False,
         "how_to_use": (
             "Open the %s tab, put Y in the APPROVE column for the rows you "
